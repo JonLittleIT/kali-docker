@@ -1,0 +1,107 @@
+
+variables:
+    BASE_DISTROS: 'kali-rolling kali-dev kali-last-snapshot'
+    EXTRA_DISTROS: 'kali-experimental kali-bleeding-edge'
+
+stages:
+    - build
+    - register
+    - test
+    - push
+
+build-rootfs:
+    stage: build
+    image: debian:testing
+    artifacts:
+        paths:
+            - "*.tar.xz"
+    script: |
+        set -e
+        apt-get -y update
+        apt-get -y install wget debootstrap
+        KEYRING_PKG_URL=$(wget -q -O - http://http.kali.org/kali/dists/kali-rolling/main/binary-amd64/Packages.gz | gzip -dc | grep ^Filename: | grep kali-archive-keyring | head -n 1 | awk '{print $2}')
+        KEYRING_PKG_URL="http://http.kali.org/kali/$KEYRING_PKG_URL"
+        wget $KEYRING_PKG_URL
+        dpkg -i kali-archive-keyring_*_all.deb
+        for distro in $BASE_DISTROS; do
+            ./build-rootfs.sh $distro
+        done
+
+build-docker-images:
+    stage: register
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-rootfs
+    artifacts:
+        paths:
+            - "*.conf"
+    script: |
+        set -e
+        apk update
+        apk add git
+        docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+        for distro in $BASE_DISTROS; do
+            ./docker-build.sh $distro
+        done
+        for distro in $EXTRA_DISTROS; do
+            ./docker-build-extra.sh $distro
+        done
+
+test-docker-images:
+    stage: test
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-docker-images
+    script: |
+        set -e
+        docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+        for distro in $BASE_DISTROS $EXTRA_DISTROS; do
+            . ./$distro.conf || true
+            docker pull $CI_REGISTRY_IMAGE/$IMAGE:$VERSION
+            docker run $CI_REGISTRY_IMAGE/$IMAGE:$VERSION /bin/true
+            docker run $CI_REGISTRY_IMAGE/$IMAGE:$VERSION test -e /etc/dpkg/origins/kali
+        done
+
+push-docker-images:
+    stage: push
+    image: docker:latest
+    services:
+        - docker:dind
+    dependencies:
+        - build-docker-images
+    script: |
+        set -e
+        apk update
+        apk add curl jq
+        docker login -u $CI_REGISTRY_USER -p $CI_JOB_TOKEN $CI_REGISTRY
+        for distro in $BASE_DISTROS $EXTRA_DISTROS; do
+            ./docker-push.sh $distro
+        done
+        # Login to docker hub and push there too
+        DOCKER_HUB_REGISTRY="docker.io"
+        DOCKER_HUB_REGISTRY_IMAGE="index.docker.io/$DOCKER_HUB_ORGANIZATION"
+        docker login -u $DOCKER_HUB_USER -p $DOCKER_HUB_ACCESS_TOKEN $DOCKER_HUB_REGISTRY
+        for distro in $BASE_DISTROS $EXTRA_DISTROS; do
+            . ./$distro.conf || true
+            docker tag $CI_REGISTRY_IMAGE/$IMAGE:latest $DOCKER_HUB_REGISTRY_IMAGE/$IMAGE:latest
+            docker push $DOCKER_HUB_REGISTRY_IMAGE/$IMAGE:latest
+
+            # XXX: We don't push the versioned image because we are not
+            # able to cleanup old images and "docker pull" will fetch all
+            # versions of a given image...
+            # Don't push
+            #docker tag $CI_REGISTRY_IMAGE/$IMAGE:$VERSION $DOCKER_HUB_REGISTRY_IMAGE/$IMAGE:$VERSION
+            #docker push $DOCKER_HUB_REGISTRY_IMAGE/$IMAGE:$VERSION
+            # This operation is currently failing with "The operation
+            # is unsupported.".
+            #./docker-cleanup.sh $DOCKER_HUB_ORGANIZATION/$IMAGE
+        done
+
+# TODO: clean up old images that accumulate in gitlab's container registry too...
+# https://docs.gitlab.com/ee/api/container_registry.html#list-registry-repositories
+# https://docs.gitlab.com/ee/api/container_registry.html#list-repository-tags
+# https://docs.gitlab.com/ee/api/container_registry.html#delete-a-repository-tag
